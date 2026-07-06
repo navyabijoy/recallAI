@@ -1,0 +1,9 @@
+fastapi
+sqlmodel
+networkx
+openai
+apscheduler
+uvicorn
+pytest
+pydantic-settings
+python-dotenv

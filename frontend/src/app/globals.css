@@ -47,6 +47,12 @@ html, body {
   overflow: hidden;
 }
 
+/* ── Landing page override (allow scrolling) ──────────────────────────── */
+html.landing, body.landing {
+  overflow: auto;
+  height: auto;
+}
+
 /* ── Scrollbars ───────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }

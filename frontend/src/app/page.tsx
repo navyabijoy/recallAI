@@ -183,11 +183,11 @@ export default function Dashboard() {
   const sidebar = (
     <div style={S.sidebar}>
       {/* Logo */}
-      <div style={{ display:"flex", alignItems:"center", gap:8, padding:"13px 14px 11px", borderBottom:"1px solid rgba(255,255,255,0.05)" }}>
+      <Link href="/landing" style={{ display:"flex", alignItems:"center", gap:8, padding:"13px 14px 11px", borderBottom:"1px solid rgba(255,255,255,0.05)", textDecoration:"none" }}>
         <div style={{ width:20, height:20, borderRadius:4, background:"rgba(124,111,205,0.12)", border:"1px solid rgba(124,111,205,0.28)", display:"grid", placeItems:"center", fontFamily:"'JetBrains Mono',monospace", fontSize:11, fontWeight:700, color:"#7c6fcd", flexShrink:0 }}>R</div>
         <span style={{ fontSize:13, fontWeight:600, color:"#c8c8c8", letterSpacing:"-0.01em" }}>RecallAI</span>
         <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#3d3d3d", marginLeft:"auto" }}>v1.0</span>
-      </div>
+      </Link>
 
       {/* Nav */}
       <div style={{ padding:"10px 8px 4px" }}>

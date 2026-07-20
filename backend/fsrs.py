@@ -27,16 +27,17 @@ def calculate_retrievability(stability: float, last_review: datetime, current_ti
     retrievability = (1.0 + t / (9.0 * stability)) ** -0.5
     return min(1.0, max(0.0, retrievability))
 
-def update_fsrs_parameters(stability: float, difficulty: float, rating: str) -> tuple[float, float]:
+def update_fsrs_parameters(stability: float, difficulty: float, rating: str, confidence_weight: float = 1.0) -> tuple[float, float]:
     """
     Updates the stability (S) and difficulty (D) parameters for a topic based on a review rating.
     Ratings are: "AGAIN", "HARD", "GOOD", "EASY"
+    `confidence_weight` scales the magnitude of the updates (e.g. 0.3 for weak signals like GitHub commits, 1.0 for LeetCode).
     
     Returns:
       (new_stability, new_difficulty)
     """
     # 1. Update Difficulty (D)
-    # AGAIN adds difficulty, EASY reduces, GOOD keeps it stable
+    # AGAIN adds difficulty, EASY reduces, GOOD keeps it stable. All scaled by confidence_weight.
     difficulty_deltas = {
         "AGAIN": 1.5,
         "HARD": 0.5,
@@ -45,12 +46,14 @@ def update_fsrs_parameters(stability: float, difficulty: float, rating: str) -> 
     }
     
     delta_d = difficulty_deltas.get(rating.upper(), 0.0)
-    new_difficulty = max(1.0, min(10.0, difficulty + delta_d))
+    new_difficulty = max(1.0, min(10.0, difficulty + (delta_d * confidence_weight)))
     
     # 2. Update Stability (S)
     if rating.upper() == "AGAIN":
         # Concept was forgotten. Reduce stability.
-        new_stability = stability * 0.5
+        # Softer penalty if confidence_weight is lower.
+        decay_factor = 1.0 - (0.5 * confidence_weight)
+        new_stability = stability * decay_factor
     else:
         # Concept was recalled successfully. Grow stability.
         # Factor is scaled by how difficult the concept is (higher difficulty -> slower growth)
@@ -63,7 +66,8 @@ def update_fsrs_parameters(stability: float, difficulty: float, rating: str) -> 
             "EASY": 0.2
         }
         multiplier = rating_multipliers.get(rating.upper(), 0.1)
-        new_stability = stability * (1.0 + multiplier * difficulty_factor)
+        growth_factor = multiplier * difficulty_factor * confidence_weight
+        new_stability = stability * (1.0 + growth_factor)
         
     # Ensure stability doesn't fall below a safe minimum or grow excessively
     new_stability = max(0.1, min(3650.0, new_stability)) # Max 10 years stability

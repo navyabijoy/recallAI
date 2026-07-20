@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "RecallAI Telemetry",
+  "version": "0.1.0",
+  "description": "Captures how long you take to understand vs. write each DSA solution and feeds your personalized RecallAI memory model.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://leetcode.com/*",
+    "https://codeforces.com/*",
+    "http://localhost:8000/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "RecallAI Telemetry"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://leetcode.com/problems/*"],
+      "js": ["content/common.js", "content/leetcode.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://codeforces.com/*"],
+      "js": ["content/common.js", "content/codeforces.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

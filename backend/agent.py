@@ -2,13 +2,14 @@ import os
 import json
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from sqlmodel import Session, select
 from openai import AsyncOpenAI
 
-from .models import User, Topic, LearningEvent, KnowledgeNode, AgentLog
+from .models import User, Topic, LearningEvent, KnowledgeNode, AgentLog, CalendarConnection
 from .fsrs import calculate_retrievability
 from .graph_utils import get_related_concepts as graph_get_related_concepts
+from .sync.calendar_api import get_calendar_availability, get_upcoming_deadlines
 
 logger = logging.getLogger(__name__)
 
@@ -122,14 +123,24 @@ def tool_check_plan_fits_budget(plan: Dict[str, Any], available_time: int) -> Di
         "overflow_min": max(0, overflow)
     }
 
-def tool_log_recommendation(session: Session, user_id: str, plan: Dict[str, Any], reasoning: str, tool_calls_log: List[Dict[str, Any]]) -> Dict[str, Any]:
+def tool_log_recommendation(
+    session: Session,
+    user_id: str,
+    plan: Dict[str, Any],
+    reasoning: str,
+    tool_calls_log: List[Dict[str, Any]],
+    calendar_context: Optional[Dict[str, Any]] = None,
+    deadline_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Persists the final planned session and explanations to the database."""
     log_entry = AgentLog(
         user_id=user_id,
         timestamp=datetime.utcnow(),
         tool_calls={"trace": tool_calls_log},
         final_plan=plan,
-        reasoning=reasoning
+        reasoning=reasoning,
+        calendar_context=calendar_context,
+        deadline_context=deadline_context
     )
     session.add(log_entry)
     session.commit()
@@ -139,6 +150,20 @@ def tool_log_recommendation(session: Session, user_id: str, plan: Dict[str, Any]
         "log_id": log_entry.id,
         "message": "Recommendation plan logged successfully."
     }
+
+async def tool_get_calendar_availability(session: Session, user_id: str) -> Dict[str, Any]:
+    """Fetches the user's calendar free/busy slots for the next 7 days."""
+    cal_stmt = select(CalendarConnection).where(CalendarConnection.user_id == user_id)
+    connection = session.exec(cal_stmt).first()
+    auth_token = connection.auth_token if connection else "mock"
+    return await get_calendar_availability(auth_token)
+
+async def tool_get_upcoming_deadlines(session: Session, user_id: str) -> List[Dict[str, Any]]:
+    """Fetches upcoming calendar deadline events (interviews, exams, contests) for the user."""
+    cal_stmt = select(CalendarConnection).where(CalendarConnection.user_id == user_id)
+    connection = session.exec(cal_stmt).first()
+    auth_token = connection.auth_token if connection else "mock"
+    return await get_upcoming_deadlines(auth_token)
 
 # --- TOOL METADATA FOR LLM ---
 
@@ -249,6 +274,22 @@ TOOLS_SCHEMA = [
                 "required": ["plan", "reasoning"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_availability",
+            "description": "Fetch the user's calendar free/busy blocks for the next 7 days to fit study sessions.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_upcoming_deadlines",
+            "description": "Fetch upcoming interviews, exams, and contests from the user's calendar to prioritize relevant topics.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
     }
 ]
 
@@ -262,26 +303,40 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
     """
     tool_calls_trace = []
     
+    # Pre-fetch calendar data to inject into context
+    calendar_context = await tool_get_calendar_availability(session, user_id)
+    deadline_context = {"deadlines": await tool_get_upcoming_deadlines(session, user_id)}
+
     # 1. Fallback to mock if API key isn't provided
     if client is None:
         logger.info("OpenRouter client not initialized. Running mock agent loop.")
-        return await run_mock_agent(session, user_id, available_time_override)
+        return await run_mock_agent(session, user_id, available_time_override, calendar_context, deadline_context)
         
     system_instruction = (
         "You are RecallAI's Spaced Repetition Planning Agent. "
-        "Your task is to draft an optimal study plan for today based on the user's knowledge state and forgetting risks.\n"
+        "Your task is to draft an optimal study plan for today based on the user's knowledge state, forgetting risks, and real calendar availability.\n"
         "Rules:\n"
         "1. Start by fetching the user's available time and forgetting scores.\n"
-        "2. For topics with high decay (forgetting risk > 20%), fetch their topic history and related concepts.\n"
-        "3. Draft a schedule that allocates time to review high-decay topics.\n"
-        "4. Validate the schedule with check_plan_fits_budget. If it overflows, reduce topic time or drop lower priority topics and check again.\n"
-        "5. Once it fits, run log_recommendation to save the final plan and explain your logic.\n"
-        "6. Return ONLY the final plan JSON containing the keys: 'sessions' and 'reasoning'."
+        "2. Fetch calendar availability using get_calendar_availability to understand free time blocks.\n"
+        "3. Fetch upcoming deadlines using get_upcoming_deadlines - prioritize topics related to nearby deadlines.\n"
+        "4. For topics with high decay (forgetting risk > 20%), fetch their topic history and related concepts.\n"
+        "5. Draft a schedule that allocates time to review high-decay topics, fitting them inside actual free calendar slots.\n"
+        "6. Validate the schedule with check_plan_fits_budget. If it overflows, reduce topic time or drop lower priority topics and check again.\n"
+        "7. Once it fits, run log_recommendation to save the final plan and explain your logic.\n"
+        "8. Return ONLY the final plan JSON containing the keys: 'sessions' and 'reasoning'."
     )
     
     messages = [
         {"role": "system", "content": system_instruction},
-        {"role": "user", "content": f"Please plan today's study session. user_id={user_id}. Available time override={available_time_override or 'None'}"}
+        {
+            "role": "user",
+            "content": (
+                f"Please plan today's study session. user_id={user_id}. "
+                f"Available time override={available_time_override or 'None'}. "
+                f"Calendar context pre-loaded: {len(calendar_context.get('free_blocks', []))} free blocks available. "
+                f"Deadlines context pre-loaded: {len(deadline_context.get('deadlines', []))} upcoming deadline(s)."
+            )
+        }
     ]
     
     available_time = available_time_override or tool_get_available_time(session, user_id)
@@ -313,14 +368,18 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
                     elif name == "get_related_concepts":
                         tool_res = tool_get_related_concepts(session, args.get("topic_name"))
                     elif name == "get_available_time":
-                        # Apply override if specified
                         tool_res = available_time
                     elif name == "check_plan_fits_budget":
                         tool_res = tool_check_plan_fits_budget(args.get("plan", {}), available_time)
                     elif name == "log_recommendation":
                         tool_res = tool_log_recommendation(
-                            session, user_id, args.get("plan"), args.get("reasoning"), tool_calls_trace
+                            session, user_id, args.get("plan"), args.get("reasoning"),
+                            tool_calls_trace, calendar_context, deadline_context
                         )
+                    elif name == "get_calendar_availability":
+                        tool_res = calendar_context
+                    elif name == "get_upcoming_deadlines":
+                        tool_res = deadline_context.get("deadlines", [])
                     else:
                         tool_res = {"error": f"Unknown tool '{name}'"}
                         
@@ -340,18 +399,15 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
                     })
             else:
                 # If model responded with text directly and no tool calls, loop ends.
-                # Try to extract plan and reasoning if returned in raw text
                 try:
                     raw_text = response_msg.content or ""
-                    # Check if model output contains json
                     if "{" in raw_text:
                         json_start = raw_text.find("{")
                         json_end = raw_text.rfind("}") + 1
                         parsed = json.loads(raw_text[json_start:json_end])
                         if "sessions" in parsed:
-                            # Log mock recommendation if model skipped logging tool call
                             if not any(t["tool"] == "log_recommendation" for t in tool_calls_trace):
-                                tool_log_recommendation(session, user_id, parsed, parsed.get("reasoning", "Generated plan"), tool_calls_trace)
+                                tool_log_recommendation(session, user_id, parsed, parsed.get("reasoning", "Generated plan"), tool_calls_trace, calendar_context, deadline_context)
                             return {
                                 "plan": parsed,
                                 "trace": tool_calls_trace,
@@ -376,11 +432,17 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
     except Exception as e:
         logger.error(f"Error in LLM loop: {e}. Falling back to mock planner.")
         
-    return await run_mock_agent(session, user_id, available_time_override)
+    return await run_mock_agent(session, user_id, available_time_override, calendar_context, deadline_context)
 
 # --- DETERMINISTIC PORTFOLIO MOCK AGENT LOOP ---
 
-async def run_mock_agent(session: Session, user_id: str, available_time_override: int = None) -> Dict[str, Any]:
+async def run_mock_agent(
+    session: Session,
+    user_id: str,
+    available_time_override: int = None,
+    calendar_context: Optional[Dict[str, Any]] = None,
+    deadline_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Simulates the agent tool-calling execution trace deterministically.
     This serves as a high-fidelity mock implementation when API keys are not provided.
@@ -405,15 +467,49 @@ async def run_mock_agent(session: Session, user_id: str, available_time_override
         "result": scores
     })
     
-    # Identify decayed topics (limit to top 3)
+    # Step 3: get_calendar_availability
+    if calendar_context is None:
+        calendar_context = await tool_get_calendar_availability(session, user_id)
+    trace.append({
+        "step": 2,
+        "tool": "get_calendar_availability",
+        "arguments": {},
+        "result": calendar_context
+    })
+
+    # Step 4: get_upcoming_deadlines
+    if deadline_context is None:
+        deadline_context = {"deadlines": await tool_get_upcoming_deadlines(session, user_id)}
+    trace.append({
+        "step": 3,
+        "tool": "get_upcoming_deadlines",
+        "arguments": {},
+        "result": deadline_context.get("deadlines", [])
+    })
+
+    # Identify priority topics from deadlines first
+    deadline_topics = []
+    for dl in deadline_context.get("deadlines", []):
+        for t in dl.get("related_topics", []):
+            if t not in deadline_topics:
+                deadline_topics.append(t)
+
+    # Identify decayed topics from FSRS (limit to top 3, excluding already prioritized deadline topics)
     decayed_topics = [s["topic_name"] for s in scores if s["forgetting_risk"] > 0.15][:3]
-    if not decayed_topics:
-        # Seed default if empty
-        decayed_topics = ["Graphs", "Dynamic Programming"]
+    
+    # Merge: deadline topics first, then decayed topics, dedup
+    merged_topics = deadline_topics.copy()
+    for t in decayed_topics:
+        if t not in merged_topics:
+            merged_topics.append(t)
+    merged_topics = merged_topics[:3]  # Cap at 3
+
+    if not merged_topics:
+        merged_topics = ["Graphs", "Dynamic Programming"]
         
-    # Step 3: Loop through decayed topics to fetch history and relations
-    step_num = 2
-    for t_name in decayed_topics:
+    # Step 5: Loop through topics to fetch history and relations
+    step_num = 4
+    for t_name in merged_topics:
         history = tool_get_topic_history(session, user_id, t_name)
         trace.append({
             "step": step_num,
@@ -432,20 +528,31 @@ async def run_mock_agent(session: Session, user_id: str, available_time_override
         })
         step_num += 1
         
-    # Step 4: Draft a plan fitting the time budget
-    # Distribute available time evenly among decayed topics
+    # Step 6: Draft a plan fitting the time budget and free blocks
+    # Use free blocks to inform session timing
+    free_blocks = calendar_context.get("free_blocks", [])
     sessions = []
-    time_per_topic = int(avail_time / len(decayed_topics)) if decayed_topics else avail_time
-    for t_name in decayed_topics:
+    time_per_topic = int(avail_time / len(merged_topics)) if merged_topics else avail_time
+    for i, t_name in enumerate(merged_topics):
+        block_hint = ""
+        if i < len(free_blocks):
+            blk = free_blocks[i]
+            block_hint = f" Schedule in the {blk['start']}–{blk['end']} window on {blk['date']}."
+        is_deadline_topic = t_name in deadline_topics
+        focus = (
+            f"🔴 URGENT — Deadline detected! Review core {t_name} patterns.{block_hint}"
+            if is_deadline_topic
+            else f"Review concepts and practice problems to rebuild stability.{block_hint}"
+        )
         sessions.append({
             "topic": t_name,
             "duration_min": time_per_topic,
-            "focus": f"Review concepts and practice problems to rebuild stability."
+            "focus": focus
         })
         
     draft_plan = {"sessions": sessions}
     
-    # Step 5: check_plan_fits_budget
+    # Step 7: check_plan_fits_budget
     fit_res = tool_check_plan_fits_budget(draft_plan, avail_time)
     trace.append({
         "step": step_num,
@@ -455,12 +562,23 @@ async def run_mock_agent(session: Session, user_id: str, available_time_override
     })
     step_num += 1
     
-    # Step 6: log_recommendation
-    reasoning = (
-        f"Prioritized {', '.join(decayed_topics)} because they show the highest forgetting risk "
-        f"according to current FSRS metrics. Planned sessions fit within the study budget of {avail_time} minutes."
+    # Step 8: log_recommendation
+    reasoning_parts = []
+    if deadline_topics:
+        reasoning_parts.append(
+            f"Prioritized {', '.join(deadline_topics)} based on upcoming calendar deadlines."
+        )
+    if decayed_topics:
+        reasoning_parts.append(
+            f"Also included {', '.join(decayed_topics)} due to high FSRS forgetting risk."
+        )
+    reasoning_parts.append(
+        f"All sessions are scheduled within available free calendar blocks. "
+        f"Total plan fits within the {avail_time}-minute study budget."
     )
-    log_res = tool_log_recommendation(session, user_id, draft_plan, reasoning, trace)
+    reasoning = " ".join(reasoning_parts)
+    
+    log_res = tool_log_recommendation(session, user_id, draft_plan, reasoning, trace, calendar_context, deadline_context)
     trace.append({
         "step": step_num,
         "tool": "log_recommendation",
@@ -493,8 +611,9 @@ async def run_coach_agent(session: Session, user_id: str, user_message: str) -> 
         "Rules:\n"
         "1. Prior to making statements about their current knowledge state, always invoke get_forgetting_scores.\n"
         "2. If they ask about a specific topic's history, invoke get_topic_history.\n"
-        "3. Answer their questions directly, grounding your analysis in the metrics returned by tools.\n"
-        "4. Keep answers concise, helpful, and technical (FSRS-grounded)."
+        "3. If they ask about calendar or schedules, invoke get_calendar_availability and get_upcoming_deadlines.\n"
+        "4. Answer their questions directly, grounding your analysis in the metrics returned by tools.\n"
+        "5. Keep answers concise, helpful, and technical (FSRS-grounded)."
     )
     
     messages = [
@@ -536,6 +655,10 @@ async def run_coach_agent(session: Session, user_id: str, user_message: str) -> 
                         tool_res = tool_log_recommendation(
                             session, user_id, args.get("plan"), args.get("reasoning"), tool_calls_trace
                         )
+                    elif name == "get_calendar_availability":
+                        tool_res = await tool_get_calendar_availability(session, user_id)
+                    elif name == "get_upcoming_deadlines":
+                        tool_res = await tool_get_upcoming_deadlines(session, user_id)
                     else:
                         tool_res = {"error": f"Unknown tool '{name}'"}
                         
@@ -599,6 +722,29 @@ async def run_mock_coach(session: Session, user_id: str, user_message: str) -> D
                 f"the retrievability has fallen below your 90% target threshold. You should practice 1-2 medium DP problems."
             )
             
+    elif "calendar" in msg_lower or "schedule" in msg_lower or "deadline" in msg_lower or "interview" in msg_lower:
+        cal = await tool_get_calendar_availability(session, user_id)
+        deadlines = await tool_get_upcoming_deadlines(session, user_id)
+        trace.append({
+            "step": 0,
+            "tool": "get_calendar_availability",
+            "arguments": {},
+            "result": cal
+        })
+        trace.append({
+            "step": 1,
+            "tool": "get_upcoming_deadlines",
+            "arguments": {},
+            "result": deadlines
+        })
+        free_count = len(cal.get("free_blocks", []))
+        dl_summary = ", ".join([d["event_title"] for d in deadlines]) if deadlines else "none"
+        reply = (
+            f"You have {free_count} free time blocks available over the next 7 days. "
+            f"Upcoming deadlines detected: {dl_summary}. "
+            f"I recommend front-loading the related topics to those events in your earliest free blocks."
+        )
+
     elif "prereq" in msg_lower or "link" in msg_lower or "graph" in msg_lower:
         target = "Graphs"
         for t in ["Graphs", "Union Find", "Dynamic Programming", "Arrays", "Trie"]:

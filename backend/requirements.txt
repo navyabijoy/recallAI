@@ -5,5 +5,7 @@ openai
 apscheduler
 uvicorn
 pytest
+pytest-asyncio
 pydantic-settings
 python-dotenv
+httpx

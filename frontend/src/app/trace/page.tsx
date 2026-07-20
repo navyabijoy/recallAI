@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const USER_ID = "demo-user-id";
+import { authFetch } from "@/lib/auth";
 
 interface AgentLogSummary {
   id: string;
@@ -140,7 +138,7 @@ export default function TracePage() {
   async function loadLogs() {
     setLoading(true);
     try {
-      const res = await fetch(`${API}/api/users/${USER_ID}/agent-logs`);
+      const res = await authFetch(`/api/me/agent-logs`);
       if (!res.ok) throw new Error("Failed to load agent logs");
       const data = await res.json();
       setLogs(data);
@@ -154,7 +152,7 @@ export default function TracePage() {
   async function loadDetail(id: string) {
     setDetailLoading(true);
     try {
-      const res = await fetch(`${API}/api/users/${USER_ID}/agent-logs/${id}`);
+      const res = await authFetch(`/api/me/agent-logs/${id}`);
       if (!res.ok) throw new Error("Failed to load trace detail");
       const data = await res.json();
       setSelected(data);
@@ -168,7 +166,7 @@ export default function TracePage() {
   async function triggerPlan() {
     setTriggering(true);
     try {
-      const res = await fetch(`${API}/api/users/${USER_ID}/plan`);
+      const res = await authFetch(`/api/me/plan`);
       if (!res.ok) throw new Error("Failed to trigger plan");
       await loadLogs();
     } catch (e: unknown) {

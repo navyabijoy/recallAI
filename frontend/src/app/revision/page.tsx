@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-const USER_ID = "demo-user-id";
+import { authFetch } from "@/lib/auth";
 
 interface QueueProblem {
   id: string;
@@ -62,7 +60,7 @@ export default function RevisionPage() {
   async function load() {
     setLoading(true);
     try {
-      const res = await fetch(`${API}/api/users/${USER_ID}/revision-queue`);
+      const res = await authFetch(`/api/me/revision-queue`);
       if (!res.ok) throw new Error("Failed to load revision queue");
       setData(await res.json());
     } catch (e: unknown) {

@@ -2,9 +2,7 @@
 
 import React, { useState, useRef, useEffect } from "react";
 import Link from "next/link";
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-const USER_ID = "demo-user-id";
+import { authFetch, API } from "@/lib/auth";
 
 interface Message {
   role: "user" | "assistant";
@@ -72,7 +70,7 @@ export default function CoachPage() {
     setMessages(prev => [...prev, { role: "user", content: msg }]);
     setSending(true);
     try {
-      const r = await fetch(`${API}/api/users/${USER_ID}/coach/chat`, {
+      const r = await authFetch(`/api/me/coach/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: msg }),

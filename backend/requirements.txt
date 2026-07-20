@@ -9,3 +9,6 @@ pytest-asyncio
 pydantic-settings
 python-dotenv
 httpx
+pyjwt
+psycopg[binary]
+alembic

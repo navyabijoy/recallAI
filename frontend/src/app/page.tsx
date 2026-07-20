@@ -3,11 +3,9 @@
 import React, { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import dynamic from "next/dynamic";
+import { authFetch, useCurrentUser } from "@/lib/auth";
 
 const GraphViz = dynamic(() => import("../components/GraphViz"), { ssr: false });
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-const USER_ID = "demo-user-id";
 
 // ── Types ──────────────────────────────────────────────────────────────
 interface GraphNode {
@@ -110,6 +108,7 @@ const Icons = {
 
 // ── Component ──────────────────────────────────────────────────────────
 export default function Dashboard() {
+  const { user, loading: authLoading } = useCurrentUser();
   const [graphData, setGraphData]     = useState<{ nodes: GraphNode[]; edges: any[] } | null>(null);
   const [stats, setStats]             = useState<Stats | null>(null);
   const [alert, setAlert]             = useState<DecayAlert | null>(null);
@@ -133,9 +132,9 @@ export default function Dashboard() {
   const fetchAll = useCallback(async () => {
     try {
       const [g, s, a] = await Promise.all([
-        fetch(`${API}/api/users/${USER_ID}/graph`).then(r => r.ok ? r.json() : null),
-        fetch(`${API}/api/users/${USER_ID}/stats`).then(r => r.ok ? r.json() : null),
-        fetch(`${API}/api/users/${USER_ID}/decay-alert`).then(r => r.ok ? r.json() : null),
+        authFetch(`/api/me/graph`).then(r => r.ok ? r.json() : null),
+        authFetch(`/api/me/stats`).then(r => r.ok ? r.json() : null),
+        authFetch(`/api/me/decay-alert`).then(r => r.ok ? r.json() : null),
       ]);
       if (g) setGraphData(g);
       if (s) setStats(s);
@@ -148,7 +147,7 @@ export default function Dashboard() {
   const planSession = async () => {
     setLoadingPlan(true);
     try {
-      const r = await fetch(`${API}/api/users/${USER_ID}/plan`);
+      const r = await authFetch(`/api/me/plan`);
       if (r.ok) { setAgentResult(await r.json()); setActiveTab("plan"); }
     } finally { setLoadingPlan(false); }
   };
@@ -157,7 +156,7 @@ export default function Dashboard() {
     e.preventDefault();
     setLoggingEvent(true); setLogFeedback("");
     try {
-      const r = await fetch(`${API}/api/users/${USER_ID}/event`, {
+      const r = await authFetch(`/api/me/event`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ topic_name: logTopic, difficulty: logGrade, duration_min: logDuration, mistakes: logMistakes }),
@@ -169,7 +168,7 @@ export default function Dashboard() {
   const simulate = async () => {
     setSimulating(true);
     try {
-      await fetch(`${API}/api/users/${USER_ID}/simulate-inactivity?days=${simDays}`, { method: "POST" });
+      await authFetch(`/api/me/simulate-inactivity?days=${simDays}`, { method: "POST" });
       fetchAll(); setAgentResult(null);
     } finally { setSimulating(false); }
   };
@@ -448,6 +447,15 @@ export default function Dashboard() {
       </div>
     </div>
   );
+
+  // ── Auth guard ─────────────────────────────────────────────────────
+  if (authLoading || !user) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 13 }}>
+        Loading…
+      </div>
+    );
+  }
 
   // ── Render ─────────────────────────────────────────────────────────
   return (

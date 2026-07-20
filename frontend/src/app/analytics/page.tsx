@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const USER_ID = "demo-user-id";
+import { authFetch } from "@/lib/auth";
 
 interface RetentionEntry {
   topic: string;
@@ -146,9 +144,9 @@ export default function AnalyticsPage() {
     setLoading(true);
     try {
       const [analyticsRes, sourcesRes, solvesRes] = await Promise.all([
-        fetch(`${API}/api/users/${USER_ID}/analytics`),
-        fetch(`${API}/api/users/${USER_ID}/sync-sources`),
-        fetch(`${API}/api/users/${USER_ID}/solve-attempts`),
+        authFetch(`/api/me/analytics`),
+        authFetch(`/api/me/sync-sources`),
+        authFetch(`/api/me/solve-attempts`),
       ]);
       if (!analyticsRes.ok) throw new Error("Failed to load analytics");
       setData(await analyticsRes.json());
@@ -164,7 +162,7 @@ export default function AnalyticsPage() {
   async function manualSync(sourceId: string) {
     setSyncing(sourceId);
     try {
-      await fetch(`${API}/api/users/${USER_ID}/sync-sources/${sourceId}/sync`, { method: "POST" });
+      await authFetch(`/api/me/sync-sources/${sourceId}/sync`, { method: "POST" });
       await loadData();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Sync failed");
@@ -175,7 +173,7 @@ export default function AnalyticsPage() {
 
   async function disconnectSource(sourceId: string) {
     try {
-      await fetch(`${API}/api/users/${USER_ID}/sync-sources/${sourceId}`, { method: "DELETE" });
+      await authFetch(`/api/me/sync-sources/${sourceId}`, { method: "DELETE" });
       await loadData();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Disconnect failed");
@@ -185,7 +183,7 @@ export default function AnalyticsPage() {
   async function connectPlatform() {
     if (!addPlatform) return;
     try {
-      await fetch(`${API}/api/users/${USER_ID}/sync-sources`, {
+      await authFetch(`/api/me/sync-sources`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ platform: addPlatform, credential: addCred || "mock" }),

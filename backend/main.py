@@ -20,6 +20,7 @@ from .fsrs import calculate_retrievability, update_fsrs_parameters
 from .memory_model import predict_retrievability, revision_priority, prerequisite_boost, DEFAULT_DECAY_EXPONENT
 from .graph_utils import get_related_concepts, get_all_reachable_dependents
 from .solve_ingest import ingest_solve
+from .auth import router as auth_router, get_current_user
 from .agent import run_planning_agent, run_coach_agent
 from .sync.scheduler import start_scheduler, shutdown_scheduler, sync_source_now
 from .sync.base import SyncRegistry
@@ -47,18 +48,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Startup DB setup and auto-seeding
+# Google sign-in + JWT session routes.
+app.include_router(auth_router)
+
+# Startup DB setup and topic seeding
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
-    seed_dsa_data()
     ensure_topics_and_links()
     start_scheduler()
 
-# Topics added after the original seed. `ensure_topics_and_links` is idempotent,
-# so it upgrades an already-seeded database (adds missing topics, per-user
-# knowledge nodes, and prerequisite links) without a wipe.
-EXTRA_TOPICS = {
+# Global topic graph, shared by all users. Seeded idempotently on startup by
+# ensure_topics_and_links(); per-user knowledge state is created at sign-up
+# (see auth.onboard_user), not here.
+CORE_TOPICS = {
+    # Core DSA
+    "Arrays": "Basic array manipulations, two pointers, prefix sums",
+    "Sliding Window": "Subarray constraints, variable and fixed size window algorithms",
+    "Binary Search": "Divide and conquer, searching sorted spaces, search by answer",
+    "Heap": "Priority queues, top K elements, heap sort",
+    "Trie": "Prefix tree structures, word insert/search/prefix matches",
+    "Graphs": "Representations, BFS, DFS, shortest path algorithms",
+    "Union Find": "Disjoint set data structures, path compression, union by rank",
+    "Dynamic Programming": "Memoization, tabulation, state machines, knapsack problems",
+    # Python / System Design
+    "Python Functions": "First-class functions, closures, decorators, higher-order functions",
+    "Python Concurrency": "Threading, multiprocessing, asyncio, GIL, event loops",
+    "Load Balancers": "Round-robin, least connections, consistent hashing, L4 vs L7",
+    "Caching": "LRU/LFU cache, Redis, cache invalidation strategies, cache aside pattern",
+    "Database Sharding": "Horizontal partitioning, shard keys, resharding, consistent hashing",
+    # Extended DSA
     "Linked List": "Pointer manipulation, fast/slow pointers, reversal, merge",
     "Math": "Number theory, combinatorics, modular arithmetic, GCD/LCM",
     "Recursion": "Base/recursive cases, call stack, divide and conquer",
@@ -72,8 +91,17 @@ EXTRA_TOPICS = {
     "Trees": "Binary trees, traversals, BST, recursion on trees",
 }
 
-# (topic, prerequisite) — prerequisite must be mastered first.
-EXTRA_LINKS = [
+# (topic, prerequisite) — the prerequisite should be mastered first.
+CORE_LINKS = [
+    ("Sliding Window", "Arrays"),
+    ("Binary Search", "Arrays"),
+    ("Heap", "Binary Search"),
+    ("Union Find", "Graphs"),
+    ("Dynamic Programming", "Graphs"),
+    ("Dynamic Programming", "Trie"),
+    ("Python Concurrency", "Python Functions"),
+    ("Caching", "Trie"),
+    ("Database Sharding", "Load Balancers"),
     ("Backtracking", "Recursion"),
     ("Trees", "Recursion"),
     ("Dynamic Programming", "Recursion"),
@@ -83,11 +111,11 @@ EXTRA_LINKS = [
 ]
 
 def ensure_topics_and_links():
-    """Adds any missing topics, per-user knowledge nodes, and prerequisite links."""
+    """Idempotently seeds the global topic graph and back-fills per-user nodes/links."""
     with Session(engine) as session:
         existing = {t.name: t for t in session.exec(select(Topic)).all()}
         added = False
-        for name, desc in EXTRA_TOPICS.items():
+        for name, desc in CORE_TOPICS.items():
             if name not in existing:
                 session.add(Topic(name=name, description=desc))
                 added = True
@@ -95,9 +123,8 @@ def ensure_topics_and_links():
             session.commit()
             existing = {t.name: t for t in session.exec(select(Topic)).all()}
 
-        # Ensure every user has a knowledge node for every topic.
-        users = session.exec(select(User)).all()
-        for user in users:
+        # Back-fill a knowledge node per topic for every existing user.
+        for user in session.exec(select(User)).all():
             have = {n.topic_id for n in session.exec(
                 select(KnowledgeNode).where(KnowledgeNode.user_id == user.id)
             ).all()}
@@ -115,7 +142,7 @@ def ensure_topics_and_links():
             (l.topic_id, l.prerequisite_id)
             for l in session.exec(select(TopicPrerequisiteLink)).all()
         }
-        for topic_name, prereq_name in EXTRA_LINKS:
+        for topic_name, prereq_name in CORE_LINKS:
             t, p = existing.get(topic_name), existing.get(prereq_name)
             if t and p and (t.id, p.id) not in have_links:
                 session.add(TopicPrerequisiteLink(topic_id=t.id, prerequisite_id=p.id))
@@ -127,148 +154,15 @@ def ensure_topics_and_links():
 def on_shutdown():
     shutdown_scheduler()
 
-def seed_dsa_data():
-    """Seeds default user, topics, and dependency links if database is empty."""
-    with Session(engine) as session:
-        # Check if topics exist
-        existing_topics = session.exec(select(Topic)).all()
-        if existing_topics:
-            logger.info("Database already seeded.")
-            return
+# --- USER ENDPOINTS (authenticated as the current user) ---
 
-        logger.info("Seeding database with default DSA + Python + System Design topics...")
-        # 1. Create default User
-        default_user = User(
-            id="demo-user-id",
-            name="Navya",
-            email="navya@recallai.io",
-            preferences={"dailyStudyTimeMinutes": 120}
-        )
-        session.add(default_user)
-
-        # 2. Create DSA Topics
-        dsa_topics = {
-            "Arrays": Topic(name="Arrays", description="Basic array manipulations, two pointers, prefix sums"),
-            "Sliding Window": Topic(name="Sliding Window", description="Subarray constraints, variable and fixed size window algorithms"),
-            "Binary Search": Topic(name="Binary Search", description="Divide and conquer, searching sorted spaces, search by answer"),
-            "Heap": Topic(name="Heap", description="Priority queues, top K elements, heap sort"),
-            "Trie": Topic(name="Trie", description="Prefix tree structures, word insert/search/prefix matches"),
-            "Graphs": Topic(name="Graphs", description="Representations, BFS, DFS, shortest path algorithms"),
-            "Union Find": Topic(name="Union Find", description="Disjoint set data structures, path compression, union by rank"),
-            "Dynamic Programming": Topic(name="Dynamic Programming", description="Memoization, tabulation, state machines, knapsack problems"),
-        }
-
-        # 3. Create Python & System Design Topics
-        sysdesign_topics = {
-            "Python Functions": Topic(name="Python Functions", description="First-class functions, closures, decorators, higher-order functions"),
-            "Python Concurrency": Topic(name="Python Concurrency", description="Threading, multiprocessing, asyncio, GIL, event loops"),
-            "Load Balancers": Topic(name="Load Balancers", description="Round-robin, least connections, consistent hashing, L4 vs L7"),
-            "Caching": Topic(name="Caching", description="LRU/LFU cache, Redis, cache invalidation strategies, cache aside pattern"),
-            "Database Sharding": Topic(name="Database Sharding", description="Horizontal partitioning, shard keys, resharding, consistent hashing"),
-        }
-
-        all_topics = {**dsa_topics, **sysdesign_topics}
-        for topic in all_topics.values():
-            session.add(topic)
-        session.commit()
-
-        # Refresh to get IDs
-        for name, topic in all_topics.items():
-            session.refresh(topic)
-
-        # 4. Create DSA Prerequisite Links
-        dsa_links = [
-            TopicPrerequisiteLink(topic_id=dsa_topics["Sliding Window"].id, prerequisite_id=dsa_topics["Arrays"].id),
-            TopicPrerequisiteLink(topic_id=dsa_topics["Binary Search"].id, prerequisite_id=dsa_topics["Arrays"].id),
-            TopicPrerequisiteLink(topic_id=dsa_topics["Heap"].id, prerequisite_id=dsa_topics["Binary Search"].id),
-            TopicPrerequisiteLink(topic_id=dsa_topics["Union Find"].id, prerequisite_id=dsa_topics["Graphs"].id),
-            TopicPrerequisiteLink(topic_id=dsa_topics["Dynamic Programming"].id, prerequisite_id=dsa_topics["Graphs"].id),
-            TopicPrerequisiteLink(topic_id=dsa_topics["Dynamic Programming"].id, prerequisite_id=dsa_topics["Trie"].id),
-        ]
-
-        # 5. Cross-Domain Links (Python/System Design → DSA)
-        cross_links = [
-            TopicPrerequisiteLink(topic_id=sysdesign_topics["Python Concurrency"].id, prerequisite_id=sysdesign_topics["Python Functions"].id),
-            TopicPrerequisiteLink(topic_id=sysdesign_topics["Caching"].id, prerequisite_id=dsa_topics["Trie"].id),
-            TopicPrerequisiteLink(topic_id=sysdesign_topics["Database Sharding"].id, prerequisite_id=sysdesign_topics["Load Balancers"].id),
-        ]
-
-        for link in [*dsa_links, *cross_links]:
-            session.add(link)
-
-        # 6. Seed default knowledge nodes for demo user
-        demo_nodes = [
-            KnowledgeNode(user_id=default_user.id, topic_id=dsa_topics["Arrays"].id, fsrs_stability=12.0, fsrs_difficulty=3.0, last_review=datetime.utcnow() - timedelta(days=2), practice_count=15),
-            KnowledgeNode(user_id=default_user.id, topic_id=dsa_topics["Binary Search"].id, fsrs_stability=6.0, fsrs_difficulty=4.5, last_review=datetime.utcnow() - timedelta(days=1), practice_count=8),
-            KnowledgeNode(user_id=default_user.id, topic_id=dsa_topics["Graphs"].id, fsrs_stability=4.0, fsrs_difficulty=6.0, last_review=datetime.utcnow() - timedelta(days=3), practice_count=5),
-            KnowledgeNode(user_id=default_user.id, topic_id=dsa_topics["Trie"].id, fsrs_stability=2.0, fsrs_difficulty=7.0, last_review=datetime.utcnow() - timedelta(days=5), practice_count=2),
-            KnowledgeNode(user_id=default_user.id, topic_id=dsa_topics["Dynamic Programming"].id, fsrs_stability=1.5, fsrs_difficulty=8.5, last_review=datetime.utcnow() - timedelta(days=1), practice_count=4),
-        ]
-        for node in demo_nodes:
-            session.add(node)
-
-        remaining_topics = ["Sliding Window", "Heap", "Union Find"]
-        for r_topic in remaining_topics:
-            session.add(KnowledgeNode(
-                user_id=default_user.id,
-                topic_id=dsa_topics[r_topic].id,
-                fsrs_stability=2.0,
-                fsrs_difficulty=5.0,
-                last_review=datetime.utcnow() - timedelta(days=5),
-                practice_count=0
-            ))
-
-        # System Design topics — fresh start
-        for r_topic in ["Python Functions", "Python Concurrency", "Load Balancers", "Caching", "Database Sharding"]:
-            session.add(KnowledgeNode(
-                user_id=default_user.id,
-                topic_id=sysdesign_topics[r_topic].id,
-                fsrs_stability=1.0,
-                fsrs_difficulty=6.0,
-                last_review=datetime.utcnow() - timedelta(days=7),
-                practice_count=0
-            ))
-
-        # 7. Seed default SyncSources for demo user (all in mock mode)
-        for platform in ["leetcode", "github", "codeforces"]:
-            session.add(SyncSource(
-                user_id=default_user.id,
-                platform=platform,
-                status="active",
-                auth_token="mock"
-            ))
-
-        # 8. Seed a mock CalendarConnection for demo user
-        session.add(CalendarConnection(
-            user_id=default_user.id,
-            provider="google",
-            auth_token="mock"
-        ))
-
-        session.commit()
-        logger.info("Database seeding successfully completed!")
-
-# --- USER ENDPOINTS ---
-
-@app.get("/api/users/current")
-def get_current_user(session: Session = Depends(get_session)):
-    """Simple helper to return our demo user."""
-    stmt = select(User).where(User.email == "navya@recallai.io")
-    user = session.exec(stmt).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Demo user not found.")
-    return user
-
-@app.post("/api/users/{user_id}/seed")
-def seed_user_confidence(user_id: str, ratings: Dict[str, float], session: Session = Depends(get_session)):
+@app.post("/api/me/seed")
+def seed_user_confidence(ratings: Dict[str, float], current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
-    Cold start endpoint: Seeds a user's initial FSRS parameters based on
+    Cold start endpoint: Seeds the current user's initial FSRS parameters based on
     a self-assessment (dictionary of topic_name -> rating between 1 and 5).
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     for topic_name, rating in ratings.items():
         topic_stmt = select(Topic).where(Topic.name == topic_name)
         topic = session.exec(topic_stmt).first()
@@ -300,25 +194,18 @@ def seed_user_confidence(user_id: str, ratings: Dict[str, float], session: Sessi
     session.commit()
     return {"status": "success", "message": "Knowledge graph seeded with cold-start preferences."}
 
-@app.get("/api/users/{user_id}/plan")
-async def get_study_plan(user_id: str, time_override: Optional[int] = None, session: Session = Depends(get_session)):
+@app.get("/api/me/plan")
+async def get_study_plan(time_override: Optional[int] = None, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Triggers the planning agent loop to produce a study guide schedule."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    result = await run_planning_agent(session, user_id, time_override)
+    result = await run_planning_agent(session, current_user.id, time_override)
     return result
 
-@app.post("/api/users/{user_id}/event")
-def log_learning_event(user_id: str, event_data: Dict[str, Any], session: Session = Depends(get_session)):
+@app.post("/api/me/event")
+def log_learning_event(event_data: Dict[str, Any], current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
     Logs a new study event and updates FSRS memory engine parameters (stability, difficulty).
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     topic_name = event_data.get("topic_name")
     topic_stmt = select(Topic).where(Topic.name == topic_name)
     topic = session.exec(topic_stmt).first()
@@ -374,16 +261,13 @@ def log_learning_event(user_id: str, event_data: Dict[str, Any], session: Sessio
         "forgetting_risk": round(1.0 - ret, 4)
     }
 
-@app.get("/api/users/{user_id}/graph")
-def get_user_graph_state(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/graph")
+def get_user_graph_state(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
     Returns the topics and linkages mapped to React Flow structures,
     incorporating the real FSRS retrievability score of each node to support color mapping.
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     topics = session.exec(select(Topic)).all()
     links = session.exec(select(TopicPrerequisiteLink)).all()
     
@@ -438,9 +322,10 @@ def get_user_graph_state(user_id: str, session: Session = Depends(get_session)):
         "edges": formatted_edges
     }
 
-@app.get("/api/users/{user_id}/stats")
-def get_user_stats(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/stats")
+def get_user_stats(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Calculates general stats (average retrievability/health, active logs, count)."""
+    user_id = current_user.id
     stmt = select(KnowledgeNode).where(KnowledgeNode.user_id == user_id)
     nodes = session.exec(stmt).all()
     
@@ -476,17 +361,14 @@ def get_user_stats(user_id: str, session: Session = Depends(get_session)):
         ]
     }
 
-@app.post("/api/users/{user_id}/simulate-inactivity")
-def simulate_inactivity(user_id: str, days: int = Query(default=14), session: Session = Depends(get_session)):
+@app.post("/api/me/simulate-inactivity")
+def simulate_inactivity(days: int = Query(default=14), current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
     RE-ACTIVATION SIMULATOR (Core Wow Factor).
     Sets last_review date of all knowledge nodes backward in time by X days,
     triggering sudden FSRS retrievability decay.
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     stmt = select(KnowledgeNode).where(KnowledgeNode.user_id == user_id)
     nodes = session.exec(stmt).all()
     
@@ -499,16 +381,13 @@ def simulate_inactivity(user_id: str, days: int = Query(default=14), session: Se
         "message": f"Time-traveled {days} days into the future! Check forgetting metrics now."
     }
 
-@app.get("/api/users/{user_id}/decay-alert")
-def check_decay_alert(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/decay-alert")
+def check_decay_alert(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
     Checks if active decay alerts are warranted (inactivity > 7 days or health < 80%).
     Returns the alert content matching the Section 12 PRD specification.
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     stmt = select(KnowledgeNode).where(KnowledgeNode.user_id == user_id)
     nodes = session.exec(stmt).all()
     
@@ -548,24 +427,18 @@ def check_decay_alert(user_id: str, session: Session = Depends(get_session)):
         "estimated_review_time_min": max(15, len(decayed_topics) * 20)
     }
 
-@app.post("/api/users/{user_id}/coach/chat")
-async def coach_chat(user_id: str, chat_input: Dict[str, str], session: Session = Depends(get_session)):
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+@app.post("/api/me/coach/chat")
+async def coach_chat(chat_input: Dict[str, str], current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     msg = chat_input.get("message", "")
-    result = await run_coach_agent(session, user_id, msg)
+    result = await run_coach_agent(session, current_user.id, msg)
     return result
 
 # --- AGENT TRACE ENDPOINTS ---
 
-@app.get("/api/users/{user_id}/agent-logs")
-def list_agent_logs(user_id: str, limit: int = Query(default=20), session: Session = Depends(get_session)):
+@app.get("/api/me/agent-logs")
+def list_agent_logs(limit: int = Query(default=20), current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Lists past agent planning run traces (most recent first)."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user_id = current_user.id
     stmt = select(AgentLog).where(AgentLog.user_id == user_id).order_by(AgentLog.timestamp.desc()).limit(limit)
     logs = session.exec(stmt).all()
     return [
@@ -579,11 +452,11 @@ def list_agent_logs(user_id: str, limit: int = Query(default=20), session: Sessi
         for l in logs
     ]
 
-@app.get("/api/users/{user_id}/agent-logs/{log_id}")
-def get_agent_log(user_id: str, log_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/agent-logs/{log_id}")
+def get_agent_log(log_id: str, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Retrieves the full detailed reasoning trace for a specific agent planning run."""
     log = session.get(AgentLog, log_id)
-    if not log or log.user_id != user_id:
+    if not log or log.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Agent log not found")
     return {
         "id": log.id,
@@ -597,12 +470,10 @@ def get_agent_log(user_id: str, log_id: str, session: Session = Depends(get_sess
 
 # --- SYNC SOURCE ENDPOINTS ---
 
-@app.get("/api/users/{user_id}/sync-sources")
-def list_sync_sources(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/sync-sources")
+def list_sync_sources(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Lists all platform sync sources for the user."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user_id = current_user.id
     stmt = select(SyncSource).where(SyncSource.user_id == user_id)
     sources = session.exec(stmt).all()
     return [
@@ -615,13 +486,10 @@ def list_sync_sources(user_id: str, session: Session = Depends(get_session)):
         for s in sources
     ]
 
-@app.post("/api/users/{user_id}/sync-sources")
-def create_sync_source(user_id: str, source_data: Dict[str, str], session: Session = Depends(get_session)):
+@app.post("/api/me/sync-sources")
+def create_sync_source(source_data: Dict[str, str], current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Connects a new platform (LeetCode, GitHub, Codeforces) for the user."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     platform = source_data.get("platform", "").lower()
     registered = SyncRegistry.list_platforms()
     if platform not in registered:
@@ -639,20 +507,20 @@ def create_sync_source(user_id: str, source_data: Dict[str, str], session: Sessi
     session.refresh(source)
     return {"id": source.id, "platform": source.platform, "status": source.status}
 
-@app.post("/api/users/{user_id}/sync-sources/{source_id}/sync")
-async def trigger_manual_sync(user_id: str, source_id: str, session: Session = Depends(get_session)):
+@app.post("/api/me/sync-sources/{source_id}/sync")
+async def trigger_manual_sync(source_id: str, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Manually triggers a sync for a specific platform source."""
     source = session.get(SyncSource, source_id)
-    if not source or source.user_id != user_id:
+    if not source or source.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Sync source not found")
     count = await sync_source_now(session, source)
     return {"status": "success", "events_synced": count}
 
-@app.delete("/api/users/{user_id}/sync-sources/{source_id}")
-def disconnect_sync_source(user_id: str, source_id: str, session: Session = Depends(get_session)):
+@app.delete("/api/me/sync-sources/{source_id}")
+def disconnect_sync_source(source_id: str, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Disconnects a platform sync source."""
     source = session.get(SyncSource, source_id)
-    if not source or source.user_id != user_id:
+    if not source or source.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Sync source not found")
     source.status = "disconnected"
     session.add(source)
@@ -661,18 +529,15 @@ def disconnect_sync_source(user_id: str, source_id: str, session: Session = Depe
 
 # --- ANALYTICS ENDPOINT ---
 
-@app.get("/api/users/{user_id}/analytics")
-def get_analytics(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/analytics")
+def get_analytics(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
     Computes analytics stats including:
     - Retention score trend (per-topic FSRS retrievability)
     - Platform sync health (each source status & last sync)
     - Practice accuracy rates by topic (based on LearningEvent records)
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+    user_id = current_user.id
     # 1. Knowledge node retention stats
     nodes_stmt = select(KnowledgeNode).where(KnowledgeNode.user_id == user_id)
     nodes = session.exec(nodes_stmt).all()
@@ -746,21 +611,19 @@ def get_analytics(user_id: str, session: Session = Depends(get_session)):
 
 # --- CALENDAR ENDPOINTS ---
 
-@app.get("/api/users/{user_id}/calendar/connection")
-def get_calendar_connection(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/calendar/connection")
+def get_calendar_connection(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Returns calendar connection status for the user."""
-    stmt = select(CalendarConnection).where(CalendarConnection.user_id == user_id)
+    stmt = select(CalendarConnection).where(CalendarConnection.user_id == current_user.id)
     conn = session.exec(stmt).first()
     if not conn:
         return {"connected": False}
     return {"connected": True, "provider": conn.provider, "last_synced_at": conn.last_synced_at}
 
-@app.post("/api/users/{user_id}/calendar/connection")
-def create_calendar_connection(user_id: str, data: Dict[str, str], session: Session = Depends(get_session)):
+@app.post("/api/me/calendar/connection")
+def create_calendar_connection(data: Dict[str, str], current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Creates or updates a Google Calendar connection (mock or real OAuth token JSON)."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user_id = current_user.id
     stmt = select(CalendarConnection).where(CalendarConnection.user_id == user_id)
     conn = session.exec(stmt).first()
     if conn:
@@ -799,26 +662,20 @@ def get_api_key_user(
     session.commit()
     return user
 
-@app.post("/api/users/{user_id}/api-keys")
-def create_api_key(user_id: str, data: Optional[Dict[str, str]] = None, session: Session = Depends(get_session)):
+@app.post("/api/me/api-keys")
+def create_api_key(data: Optional[Dict[str, str]] = None, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Issues a new API key the browser extension uses to post solve telemetry."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    key = ApiKey(user_id=user_id, label=(data or {}).get("label", "browser-extension"))
+    key = ApiKey(user_id=current_user.id, label=(data or {}).get("label", "browser-extension"))
     session.add(key)
     session.commit()
     session.refresh(key)
     # Full key is only ever returned once, at creation time.
     return {"id": key.id, "key": key.key, "label": key.label, "created_at": key.created_at.isoformat()}
 
-@app.get("/api/users/{user_id}/api-keys")
-def list_api_keys(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/api-keys")
+def list_api_keys(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Lists the user's API keys (masked; the full secret is shown only at creation)."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    keys = session.exec(select(ApiKey).where(ApiKey.user_id == user_id)).all()
+    keys = session.exec(select(ApiKey).where(ApiKey.user_id == current_user.id)).all()
     return [
         {
             "id": k.id,
@@ -852,16 +709,14 @@ def post_solve_telemetry(
         raise HTTPException(status_code=422, detail="platform and platform_problem_id are required")
     return ingest_solve(session, user, payload)
 
-@app.get("/api/users/{user_id}/revision-queue")
-async def get_revision_queue(user_id: str, session: Session = Depends(get_session)):
+@app.get("/api/me/revision-queue")
+async def get_revision_queue(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """
     The core output: topics ranked by how urgently the user should revise them,
     using their personalized forgetting curve, prerequisite structure, and calendar
     deadlines. Each topic carries the problems the user has actually solved for it.
     """
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user_id = current_user.id
 
     params = session.get(UserMemoryParams, user_id)
     decay = params.decay_exponent if params else DEFAULT_DECAY_EXPONENT
@@ -942,12 +797,10 @@ async def get_revision_queue(user_id: str, session: Session = Depends(get_sessio
         "queue": queue,
     }
 
-@app.get("/api/users/{user_id}/solve-attempts")
-def list_solve_attempts(user_id: str, limit: int = Query(default=25), session: Session = Depends(get_session)):
+@app.get("/api/me/solve-attempts")
+def list_solve_attempts(limit: int = Query(default=25), current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Recent solve telemetry (understand vs. write time, attempts, derived recall) — most recent first."""
-    user = session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user_id = current_user.id
     stmt = (
         select(SolveAttempt).where(SolveAttempt.user_id == user_id)
         .order_by(SolveAttempt.submitted_at.desc()).limit(limit)

@@ -1,10 +1,10 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from sqlmodel import Session, select
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 
 from .models import User, Topic, LearningEvent, KnowledgeNode, AgentLog, CalendarConnection
 from .fsrs import calculate_retrievability
@@ -13,22 +13,29 @@ from .sync.calendar_api import get_calendar_availability, get_upcoming_deadlines
 
 logger = logging.getLogger(__name__)
 
-# OpenRouter Configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3-8b-instruct:free")
+# Anthropic Configuration
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME", "claude-sonnet-5")
+AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "2048"))
+# Cap real-LLM agent invocations per user per rolling 24h window (cost control for beta).
+AGENT_DAILY_CALL_CAP = int(os.getenv("AGENT_DAILY_CALL_CAP", "20"))
 
 # Create Client (safe if key is missing/placeholder)
-if OPENROUTER_API_KEY and OPENROUTER_API_KEY != "placeholder":
-    client = AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-        default_headers={
-            "HTTP-Referer": "https://github.com/recallai/recallai",
-            "X-Title": "RecallAI Agentic Planner"
-        }
-    )
+if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "placeholder":
+    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 else:
     client = None
+
+
+def _daily_agent_call_count(session: Session, user_id: str) -> int:
+    """Counts AgentLog rows for this user in the last 24h, as a proxy for real-LLM agent calls."""
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    stmt = select(AgentLog).where(AgentLog.user_id == user_id, AgentLog.timestamp >= cutoff)
+    return len(session.exec(stmt).all())
+
+
+def _daily_cap_exceeded(session: Session, user_id: str) -> bool:
+    return _daily_agent_call_count(session, user_id) >= AGENT_DAILY_CALL_CAP
 
 # --- TOOL IMPLEMENTATIONS ---
 
@@ -169,127 +176,103 @@ async def tool_get_upcoming_deadlines(session: Session, user_id: str) -> List[Di
 
 TOOLS_SCHEMA = [
     {
-        "type": "function",
-        "function": {
-            "name": "get_forgetting_scores",
-            "description": "Get forgetting probability scores based on FSRS calculations for all topics.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
+        "name": "get_forgetting_scores",
+        "description": "Get forgetting probability scores based on FSRS calculations for all topics.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_topic_history",
+        "description": "Get user practice history metrics (attempts, mistakes, success rate, grades) for a topic.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_name": {"type": "string", "description": "The name of the topic, e.g. 'Graphs'"}
+            },
+            "required": ["topic_name"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_topic_history",
-            "description": "Get user practice history metrics (attempts, mistakes, success rate, grades) for a topic.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic_name": {"type": "string", "description": "The name of the topic, e.g. 'Graphs'"}
-                },
-                "required": ["topic_name"]
-            }
+        "name": "get_related_concepts",
+        "description": "Query knowledge graph prerequisites and dependents for a topic.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_name": {"type": "string", "description": "Name of the topic"}
+            },
+            "required": ["topic_name"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_related_concepts",
-            "description": "Query knowledge graph prerequisites and dependents for a topic.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic_name": {"type": "string", "description": "Name of the topic"}
-                },
-                "required": ["topic_name"]
-            }
-        }
+        "name": "get_available_time",
+        "description": "Retrieve the user's active session time budget.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_available_time",
-            "description": "Retrieve the user's active session time budget.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_plan_fits_budget",
-            "description": "Check if a draft plan fits the available time budget.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plan": {
-                        "type": "object",
-                        "properties": {
-                            "sessions": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "topic": {"type": "string"},
-                                        "duration_min": {"type": "integer"},
-                                        "focus": {"type": "string"}
-                                    },
-                                    "required": ["topic", "duration_min"]
-                                }
+        "name": "check_plan_fits_budget",
+        "description": "Check if a draft plan fits the available time budget.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "object",
+                    "properties": {
+                        "sessions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "topic": {"type": "string"},
+                                    "duration_min": {"type": "integer"},
+                                    "focus": {"type": "string"}
+                                },
+                                "required": ["topic", "duration_min"]
                             }
-                        },
-                        "required": ["sessions"]
-                    }
-                },
-                "required": ["plan"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "log_recommendation",
-            "description": "Persist the finalized revision plan and explanatory reasoning.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plan": {
-                        "type": "object",
-                        "properties": {
-                            "sessions": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "topic": {"type": "string"},
-                                        "duration_min": {"type": "integer"},
-                                        "focus": {"type": "string"}
-                                    },
-                                    "required": ["topic", "duration_min"]
-                                }
-                            }
-                        },
-                        "required": ["sessions"]
+                        }
                     },
-                    "reasoning": {"type": "string", "description": "Detailed reasoning for selecting this plan."}
+                    "required": ["sessions"]
+                }
+            },
+            "required": ["plan"]
+        }
+    },
+    {
+        "name": "log_recommendation",
+        "description": "Persist the finalized revision plan and explanatory reasoning.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "object",
+                    "properties": {
+                        "sessions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "topic": {"type": "string"},
+                                    "duration_min": {"type": "integer"},
+                                    "focus": {"type": "string"}
+                                },
+                                "required": ["topic", "duration_min"]
+                            }
+                        }
+                    },
+                    "required": ["sessions"]
                 },
-                "required": ["plan", "reasoning"]
-            }
+                "reasoning": {"type": "string", "description": "Detailed reasoning for selecting this plan."}
+            },
+            "required": ["plan", "reasoning"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_calendar_availability",
-            "description": "Fetch the user's calendar free/busy blocks for the next 7 days to fit study sessions.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
+        "name": "get_calendar_availability",
+        "description": "Fetch the user's calendar free/busy blocks for the next 7 days to fit study sessions.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_upcoming_deadlines",
-            "description": "Fetch upcoming interviews, exams, and contests from the user's calendar to prioritize relevant topics.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
+        "name": "get_upcoming_deadlines",
+        "description": "Fetch upcoming interviews, exams, and contests from the user's calendar to prioritize relevant topics.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     }
 ]
 
@@ -307,11 +290,15 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
     calendar_context = await tool_get_calendar_availability(session, user_id)
     deadline_context = {"deadlines": await tool_get_upcoming_deadlines(session, user_id)}
 
-    # 1. Fallback to mock if API key isn't provided
+    # 1. Fallback to mock if API key isn't provided or the daily cost cap was hit
     if client is None:
-        logger.info("OpenRouter client not initialized. Running mock agent loop.")
+        logger.info("Anthropic client not initialized. Running mock agent loop.")
         return await run_mock_agent(session, user_id, available_time_override, calendar_context, deadline_context)
-        
+
+    if _daily_cap_exceeded(session, user_id):
+        logger.info(f"Daily agent call cap reached for user {user_id}. Running mock agent loop.")
+        return await run_mock_agent(session, user_id, available_time_override, calendar_context, deadline_context)
+
     system_instruction = (
         "You are RecallAI's Spaced Repetition Planning Agent. "
         "Your task is to draft an optimal study plan for today based on the user's knowledge state, forgetting risks, and real calendar availability.\n"
@@ -325,9 +312,8 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
         "7. Once it fits, run log_recommendation to save the final plan and explain your logic.\n"
         "8. Return ONLY the final plan JSON containing the keys: 'sessions' and 'reasoning'."
     )
-    
+
     messages = [
-        {"role": "system", "content": system_instruction},
         {
             "role": "user",
             "content": (
@@ -338,27 +324,29 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
             )
         }
     ]
-    
+
     available_time = available_time_override or tool_get_available_time(session, user_id)
-    
+
     try:
         for step in range(12):  # Limit loop to 12 steps to prevent infinite running
-            response = await client.chat.completions.create(
+            response = await client.messages.create(
                 model=MODEL_NAME,
+                max_tokens=AGENT_MAX_TOKENS,
+                system=system_instruction,
                 messages=messages,
                 tools=TOOLS_SCHEMA,
-                tool_choice="auto"
             )
-            
-            response_msg = response.choices[0].message
-            messages.append(response_msg)
-            
+
+            messages.append({"role": "assistant", "content": response.content})
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+
             # If the model requested tool calls
-            if response_msg.tool_calls:
-                for tc in response_msg.tool_calls:
-                    name = tc.function.name
-                    args = json.loads(tc.function.arguments or "{}")
-                    
+            if tool_use_blocks:
+                tool_result_content = []
+                for block in tool_use_blocks:
+                    name = block.name
+                    args = block.input or {}
+
                     # Execute tool
                     tool_res = None
                     if name == "get_forgetting_scores":
@@ -382,7 +370,7 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
                         tool_res = deadline_context.get("deadlines", [])
                     else:
                         tool_res = {"error": f"Unknown tool '{name}'"}
-                        
+
                     # Log trace
                     tool_calls_trace.append({
                         "step": step,
@@ -390,17 +378,18 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
                         "arguments": args,
                         "result": tool_res
                     })
-                    
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": name,
+
+                    tool_result_content.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
                         "content": json.dumps(tool_res)
                     })
+
+                messages.append({"role": "user", "content": tool_result_content})
             else:
                 # If model responded with text directly and no tool calls, loop ends.
                 try:
-                    raw_text = response_msg.content or ""
+                    raw_text = "".join(b.text for b in response.content if b.type == "text")
                     if "{" in raw_text:
                         json_start = raw_text.find("{")
                         json_end = raw_text.rfind("}") + 1
@@ -415,9 +404,9 @@ async def run_planning_agent(session: Session, user_id: str, available_time_over
                             }
                 except Exception as parse_err:
                     logger.warning(f"Error parsing raw text reply from LLM: {parse_err}")
-                
+
                 break
-                
+
         # Return whatever was logged last, or build final summary
         log_stmt = select(AgentLog).where(AgentLog.user_id == user_id).order_by(AgentLog.timestamp.desc())
         last_log = session.exec(log_stmt).first()
@@ -596,14 +585,14 @@ async def run_mock_agent(
 async def run_coach_agent(session: Session, user_id: str, user_message: str) -> Dict[str, Any]:
     """
     Runs the conversational AI Coach Agent.
-    If OpenRouter client is None or model fails, executes a highly responsive deterministic mock coach
-    to keep portfolio flow running.
+    If the Anthropic client is None, the model call fails, or the daily call cap is hit,
+    executes a deterministic mock coach instead.
     """
     tool_calls_trace = []
-    
-    if client is None:
+
+    if client is None or _daily_cap_exceeded(session, user_id):
         return await run_mock_coach(session, user_id, user_message)
-        
+
     system_instruction = (
         "You are RecallAI's Spaced Repetition Learning Coach. "
         "Your task is to converse with the user, answer their queries, explain FSRS score patterns, "
@@ -617,28 +606,29 @@ async def run_coach_agent(session: Session, user_id: str, user_message: str) -> 
     )
     
     messages = [
-        {"role": "system", "content": system_instruction},
         {"role": "user", "content": user_message}
     ]
-    
+
     try:
         reply_content = "I reviewed your metrics but couldn't construct a proper response."
         for step in range(8):
-            response = await client.chat.completions.create(
+            response = await client.messages.create(
                 model=MODEL_NAME,
+                max_tokens=AGENT_MAX_TOKENS,
+                system=system_instruction,
                 messages=messages,
                 tools=TOOLS_SCHEMA,
-                tool_choice="auto"
             )
-            
-            response_msg = response.choices[0].message
-            messages.append(response_msg)
-            
-            if response_msg.tool_calls:
-                for tc in response_msg.tool_calls:
-                    name = tc.function.name
-                    args = json.loads(tc.function.arguments or "{}")
-                    
+
+            messages.append({"role": "assistant", "content": response.content})
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+
+            if tool_use_blocks:
+                tool_result_content = []
+                for block in tool_use_blocks:
+                    name = block.name
+                    args = block.input or {}
+
                     tool_res = None
                     if name == "get_forgetting_scores":
                         tool_res = tool_get_forgetting_scores(session, user_id)
@@ -661,31 +651,32 @@ async def run_coach_agent(session: Session, user_id: str, user_message: str) -> 
                         tool_res = await tool_get_upcoming_deadlines(session, user_id)
                     else:
                         tool_res = {"error": f"Unknown tool '{name}'"}
-                        
+
                     tool_calls_trace.append({
                         "step": step,
                         "tool": name,
                         "arguments": args,
                         "result": tool_res
                     })
-                    
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": name,
+
+                    tool_result_content.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
                         "content": json.dumps(tool_res)
                     })
+
+                messages.append({"role": "user", "content": tool_result_content})
             else:
-                reply_content = response_msg.content or ""
+                reply_content = "".join(b.text for b in response.content if b.type == "text")
                 break
-                
+
         return {
             "reply": reply_content,
             "trace": tool_calls_trace
         }
     except Exception as e:
         logger.error(f"Error in coach agent: {e}")
-        
+
     return await run_mock_coach(session, user_id, user_message)
 
 async def run_mock_coach(session: Session, user_id: str, user_message: str) -> Dict[str, Any]:

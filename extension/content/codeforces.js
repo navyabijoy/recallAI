@@ -14,7 +14,9 @@
     ratingTag: ".tag-box[title='Difficulty'], span.tag-box", // e.g. "*1500"
     topicTags: "a.tag-box, .roundbox .tag-box",
     sourceTextarea: "textarea#sourceCodeTextarea, textarea[name='source'], .ace_text-input",
-    verdictCell: "td.status-verdict-cell, span.verdict-accepted, span.verdict-rejected",
+    submissionRow: "tr[data-submission-id]",
+    verdictCell: "td.status-verdict-cell",
+    problemLink: "a[href*='/problem/']",
   };
 
   // /problemset/problem/1520/D  or  /contest/1520/problem/D
@@ -49,10 +51,10 @@
     return el ? el.textContent.trim() : document.title.replace(/ - Codeforces.*/, "").trim();
   }
 
-  function startProblem() {
+  async function startProblem() {
     const pid = problemIdFromUrl();
     if (!pid) return;
-    tracker.openProblem("codeforces:" + pid, {
+    await tracker.openProblem("codeforces:" + pid, {
       platform: "codeforces",
       platform_problem_id: pid,
       title: scrapeTitle(),
@@ -69,20 +71,75 @@
     }
   }, true);
 
-  // Read verdicts from the submissions/status table.
-  const seen = new WeakSet();
+  // CF submits on a separate page from the problem statement (the tracker's
+  // `key` survives the navigation — see startProblem/onUrlChange below), so we
+  // read the verdict from "my submissions" pages. We deliberately do NOT watch
+  // the general /status or /submissions tables: those list every user's rows,
+  // and attributing a stranger's verdict to whatever problem we last opened
+  // would silently corrupt telemetry.
+  function isMySubmissionsPage() {
+    return /\/my(\/|$)/.test(location.pathname) || /\bmy=on\b/.test(location.search);
+  }
+
+  function rowProblemId(row) {
+    const link = row.querySelector(SELECTORS.problemLink);
+    if (!link) return null;
+    const href = link.getAttribute("href") || "";
+    let m = href.match(/\/problemset\/problem\/(\d+)\/([A-Za-z0-9]+)/);
+    if (m) return m[1] + "/" + m[2];
+    m = href.match(/\/contest\/(\d+)\/problem\/([A-Za-z0-9]+)/);
+    return m ? m[1] + "/" + m[2] : null;
+  }
+
+  // CF's submit page is a fresh page load, so this content script's `tracker`
+  // starts with no key here — resume whichever tracked problem (if any) has a
+  // row on this page from the state common.js persisted on the problem page.
+  let resuming = false;
+  async function resumeTrackingForSubmissionsPage() {
+    if (tracker.key || resuming || !isMySubmissionsPage()) return;
+    resuming = true;
+    try {
+      for (const row of document.querySelectorAll(SELECTORS.submissionRow)) {
+        const pid = rowProblemId(row);
+        if (!pid) continue;
+        const key = "codeforces:" + pid;
+        const storageKey = "recallai_track_" + key;
+        const stored = await chrome.storage.local.get([storageKey]);
+        const saved = stored[storageKey];
+        if (saved && saved.savedAt && Date.now() - saved.savedAt < 24 * 60 * 60 * 1000) {
+          await tracker.openProblem(key, saved.meta || { platform: "codeforces", platform_problem_id: pid });
+          break;
+        }
+      }
+    } finally {
+      resuming = false;
+    }
+  }
+
+  const seenVerdicts = new WeakSet();
   const observer = new MutationObserver(() => {
-    document.querySelectorAll(SELECTORS.verdictCell).forEach((cell) => {
+    if (!isMySubmissionsPage()) return;
+    if (!tracker.key) {
+      resumeTrackingForSubmissionsPage();
+      return;
+    }
+    const currentPid = tracker.key.slice("codeforces:".length);
+    for (const row of document.querySelectorAll(SELECTORS.submissionRow)) {
+      if (rowProblemId(row) !== currentPid) continue;
+      const cell = row.querySelector(SELECTORS.verdictCell);
+      if (!cell) continue;
       const txt = (cell.textContent || "").trim();
-      if (!txt || seen.has(cell)) return;
+      if (!txt || seenVerdicts.has(cell)) continue;
       if (/Accepted|Wrong answer|Time limit|Runtime error|Compilation error|Memory limit/i.test(txt)) {
-        seen.add(cell);
+        seenVerdicts.add(cell);
         const verdict = /Accepted/i.test(txt) ? "Accepted" : txt;
         tracker.recordSubmit(verdict);
       }
-    });
+      break; // most recent row for this problem only
+    }
   });
   observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+  resumeTrackingForSubmissionsPage(); // rows may already be in the DOM before any mutation fires
 
   ns.onUrlChange(() => {
     if (/\/problem\//.test(location.pathname)) startProblem();

@@ -4,6 +4,7 @@ import secrets
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from sqlmodel import Field, SQLModel, Relationship, JSON, Column, create_engine, Session
+from sqlalchemy import UniqueConstraint
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./recallai.db")
@@ -141,6 +142,10 @@ class Problem(SQLModel, table=True):
     Canonical identity of a real coding problem (shared across all users).
     A single problem may map to several RecallAI topics via ProblemTopicLink.
     """
+    __table_args__ = (
+        UniqueConstraint("platform", "platform_problem_id", name="uq_problem_platform_ppid"),
+    )
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     platform: str = Field(index=True)              # "leetcode", "codeforces"
     platform_problem_id: str = Field(index=True)   # slug ("two-sum") or CF "1520/D"
@@ -163,6 +168,12 @@ class SolveAttempt(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     user_id: str = Field(foreign_key="user.id", index=True)
     problem_id: str = Field(foreign_key="problem.id", index=True)
+
+    # Client-generated idempotency key (one per problem-solve session). Lets the
+    # extension safely retry a POST (reload, offline queue, multi-tab) without
+    # creating duplicate rows that would corrupt the memory model. NULLs (manual/
+    # api_backfill entries with no client) are exempt from the uniqueness check.
+    client_event_id: Optional[str] = Field(default=None, unique=True, index=True)
 
     # Timing telemetry (seconds). understand = first_keystroke - opened; write = submitted - first_keystroke.
     opened_at: Optional[datetime] = None

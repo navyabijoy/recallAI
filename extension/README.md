@@ -15,17 +15,18 @@ Time spent with the tab hidden is subtracted, and each interval is capped at 60 
 
 ## Setup
 
-1. Run the backend (`uvicorn backend.main:app --reload`, default `http://localhost:8000`).
-2. Mint an API key for your user:
-   ```
-   curl -s -X POST http://localhost:8000/api/users/<USER_ID>/api-keys \
-        -H 'Content-Type: application/json' -d '{"label":"my-browser"}'
-   ```
-   (`GET /api/users/current` returns the demo user id.)
+1. Run the backend locally (`uvicorn backend.main:app --reload`, default `http://localhost:8000`),
+   or point at the deployed Railway backend URL for beta testers.
+2. Mint an API key while logged into the web app (`POST /api/me/api-keys`, Bearer JWT auth) —
+   easiest via the Settings page in the frontend once it's built.
 3. Load the extension: `chrome://extensions` → enable **Developer mode** →
    **Load unpacked** → select this `extension/` folder.
 4. Click the RecallAI toolbar icon, paste the **backend URL** and **API key**, Save.
 5. Solve a problem. The popup shows the last-sent status.
+
+For beta testers hitting a deployed backend (not localhost), `manifest.json`'s
+`host_permissions` must include that origin — it already covers `*.up.railway.app`;
+add your custom domain there if you use one, then reload the unpacked extension.
 
 ## Architecture
 

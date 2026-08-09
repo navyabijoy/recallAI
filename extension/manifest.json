@@ -3,11 +3,12 @@
   "name": "RecallAI Telemetry",
   "version": "0.1.0",
   "description": "Captures how long you take to understand vs. write each DSA solution and feeds your personalized RecallAI memory model.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "alarms"],
   "host_permissions": [
     "https://leetcode.com/*",
     "https://codeforces.com/*",
-    "http://localhost:8000/*"
+    "http://localhost:8000/*",
+    "https://*.up.railway.app/*"
   ],
   "background": { "service_worker": "background.js" },
   "action": {

@@ -18,13 +18,14 @@ from urllib.parse import urlencode
 
 import jwt
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from sqlmodel import Session, select
 
 from .config import settings
 from .models import get_session, User, Topic, KnowledgeNode, UserMemoryParams
 from .memory_model import DEFAULT_DECAY_EXPONENT, DEFAULT_STABILITY_GROWTH
+from .rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,8 @@ async def exchange_code_for_userinfo(code: str) -> Dict[str, Any]:
 # --- routes ---
 
 @router.get("/api/auth/google/login")
-def google_login():
+@limiter.limit("10/minute")
+def google_login(request: Request):
     if not settings.google_configured:
         raise HTTPException(
             status_code=503,
@@ -183,7 +185,9 @@ def google_login():
 
 
 @router.get("/api/auth/google/callback")
+@limiter.limit("10/minute")
 async def google_callback(
+    request: Request,
     code: Optional[str] = Query(default=None),
     state: Optional[str] = Query(default=None),
     error: Optional[str] = Query(default=None),

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from sqlmodel import Session, select, and_
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from ..config import settings
 from ..models import User, SyncSource, RawSyncEvent, LearningEvent, KnowledgeNode, Topic, engine
 from .base import SyncRegistry
 from ..fsrs import update_fsrs_parameters
@@ -74,9 +75,20 @@ async def sync_source_now(session: Session, source: SyncSource) -> int:
         session.commit()
         return 0
         
-    # Use 'mock' as credential fallback if not provided
-    credential = source.auth_token or "mock"
-    
+    credential = source.auth_token
+    if not credential:
+        if settings.allow_mock_sync:
+            credential = "mock"
+        else:
+            logger.warning(
+                f"Sync source {source.id} (platform={platform}) has no credential configured; "
+                "skipping rather than fabricating mock data. Set ALLOW_MOCK_SYNC=1 for local dev."
+            )
+            source.status = "needs_auth"
+            session.add(source)
+            session.commit()
+            return 0
+
     try:
         events = await adapter.sync(credential)
         new_events_count = 0

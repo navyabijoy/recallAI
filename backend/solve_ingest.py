@@ -8,6 +8,7 @@ updated per-topic memory state + per-user model parameters.
 import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, and_
 
 from .models import (
@@ -133,9 +134,38 @@ def _upsert_problem(session: Session, payload: Dict[str, Any]) -> Problem:
         topic_tags=payload_tags,
     )
     session.add(problem)
-    session.flush()  # assign problem.id
+    try:
+        session.flush()  # assign problem.id
+    except IntegrityError:
+        # Lost a race with a concurrent first-solve of the same problem.
+        session.rollback()
+        problem = session.exec(
+            select(Problem).where(
+                and_(Problem.platform == platform, Problem.platform_problem_id == ppid)
+            )
+        ).first()
+        if not problem:
+            raise
+        if not problem.topics:
+            _link_topics(session, problem, platform, payload_tags)
+        return problem
     _link_topics(session, problem, platform, payload_tags)
     return problem
+
+
+def _duplicate_summary(session: Session, attempt: SolveAttempt, params: Optional[UserMemoryParams]) -> Dict[str, Any]:
+    """Response for a retried/duplicate client_event_id — no state is mutated."""
+    problem = session.get(Problem, attempt.problem_id)
+    return {
+        "status": "duplicate",
+        "attempt_id": attempt.id,
+        "problem": (problem.title or problem.platform_problem_id) if problem else None,
+        "recall_strength": attempt.recall_strength,
+        "perceived_difficulty": attempt.perceived_difficulty,
+        "updated_topics": [],
+        "unmapped": False,
+        "decay_exponent": params.decay_exponent if params else DEFAULT_DECAY_EXPONENT,
+    }
 
 
 def _refit_user_decay(session: Session, params: UserMemoryParams) -> None:
@@ -164,6 +194,16 @@ def ingest_solve(session: Session, user: User, payload: Dict[str, Any]) -> Dict[
     source = str(payload.get("source", "extension")).lower()
     weight = SOURCE_WEIGHTS.get(source, 1.0)
 
+    client_event_id = payload.get("client_event_id")
+    if client_event_id:
+        existing = session.exec(
+            select(SolveAttempt).where(
+                and_(SolveAttempt.user_id == user.id, SolveAttempt.client_event_id == client_event_id)
+            )
+        ).first()
+        if existing:
+            return _duplicate_summary(session, existing, session.get(UserMemoryParams, user.id))
+
     problem = _upsert_problem(session, payload)
     params = _get_or_create_params(session, user.id)
 
@@ -181,6 +221,7 @@ def ingest_solve(session: Session, user: User, payload: Dict[str, Any]) -> Dict[
     attempt = SolveAttempt(
         user_id=user.id,
         problem_id=problem.id,
+        client_event_id=client_event_id,
         opened_at=_parse_dt(payload.get("opened_at")),
         first_keystroke_at=_parse_dt(payload.get("first_keystroke_at")),
         submitted_at=_parse_dt(payload.get("submitted_at")) or now,
@@ -231,7 +272,19 @@ def ingest_solve(session: Session, user: User, payload: Dict[str, Any]) -> Dict[
         updated_topics.append({"topic": topic.name, "new_stability": node.fsrs_stability})
 
     _refit_user_decay(session, params)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        # Lost a race with a concurrent request carrying the same client_event_id.
+        session.rollback()
+        existing = session.exec(
+            select(SolveAttempt).where(
+                and_(SolveAttempt.user_id == user.id, SolveAttempt.client_event_id == client_event_id)
+            )
+        ).first()
+        if existing:
+            return _duplicate_summary(session, existing, session.get(UserMemoryParams, user.id))
+        raise
     session.refresh(attempt)
 
     return {

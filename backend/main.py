@@ -7,12 +7,16 @@ load_dotenv()
 
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, Depends, HTTPException, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import Session, select, and_
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from sqlmodel import Session, select, and_, text
 
+from .config import settings
+from .rate_limit import limiter
 from .models import (
-    create_db_and_tables, get_session, User, Topic, LearningEvent,
+    get_session, User, Topic, LearningEvent,
     KnowledgeNode, AgentLog, TopicPrerequisiteLink, SyncSource, RawSyncEvent,
     CalendarConnection, Problem, SolveAttempt, UserMemoryParams, ApiKey, engine
 )
@@ -33,16 +37,21 @@ from .sync import leetcode, github, codeforces  # noqa: F401
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+if settings.sentry_dsn:
+    import sentry_sdk
+    sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.1)
+    logger.info("Sentry error tracking initialized.")
+
 app = FastAPI(title="RecallAI - Spaced Repetition Agent Backend", version="2.0.0")
 
-# CORS middleware for Next.js frontend calls.
-# NOTE: "*" origins with allow_credentials=True is an invalid combination that
-# browsers reject. The web app authenticates by user_id in the path (no cookies),
-# and the extension posts via its background worker (not subject to page CORS),
-# so we don't need credentialed CORS — keep the wildcard and turn credentials off.
+# Rate limiting — cheap abuse protection for a public-facing beta.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS middleware for Next.js frontend calls, restricted to configured origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,12 +60,30 @@ app.add_middleware(
 # Google sign-in + JWT session routes.
 app.include_router(auth_router)
 
+
+@app.get("/health")
+def health_check(session: Session = Depends(get_session)):
+    """Liveness/readiness probe — verifies the DB is reachable."""
+    session.exec(text("SELECT 1"))
+    return {"status": "ok"}
+
 # Startup DB setup and topic seeding
 @app.on_event("startup")
 def on_startup():
-    create_db_and_tables()
+    run_migrations()
     ensure_topics_and_links()
     start_scheduler()
+
+
+def run_migrations():
+    """Applies pending Alembic migrations up to head. The single source of schema truth."""
+    from alembic import command
+    from alembic.config import Config
+
+    alembic_ini = os.path.join(os.path.dirname(__file__), "alembic.ini")
+    cfg = Config(alembic_ini)
+    cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "alembic"))
+    command.upgrade(cfg, "head")
 
 # Global topic graph, shared by all users. Seeded idempotently on startup by
 # ensure_topics_and_links(); per-user knowledge state is created at sign-up
@@ -495,11 +522,13 @@ def create_sync_source(source_data: Dict[str, str], current_user: User = Depends
     if platform not in registered:
         raise HTTPException(status_code=400, detail=f"Platform '{platform}' is not supported. Supported: {registered}")
 
-    credential = source_data.get("credential", "mock")
+    credential = source_data.get("credential")
+    if not credential and settings.allow_mock_sync:
+        credential = "mock"
     source = SyncSource(
         user_id=user_id,
         platform=platform,
-        status="active",
+        status="active" if credential else "needs_auth",
         auth_token=credential
     )
     session.add(source)
@@ -691,7 +720,9 @@ def list_api_keys(current_user: User = Depends(get_current_user), session: Sessi
 # --- TELEMETRY (personalized memory model) ---
 
 @app.post("/api/telemetry/solve")
+@limiter.limit("30/minute")
 def post_solve_telemetry(
+    request: Request,
     payload: Dict[str, Any],
     user: User = Depends(get_api_key_user),
     session: Session = Depends(get_session),

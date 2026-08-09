@@ -29,6 +29,7 @@ const NODE_POSITIONS: Record<string, { x: number; y: number }> = {
 };
 
 interface KnowledgeNodeData {
+  [key: string]: unknown;
   label: string;
   risk: number;        // 0–1
   stability: number;

@@ -1,7 +1,7 @@
 fastapi
 sqlmodel
 networkx
-openai
+anthropic
 apscheduler
 uvicorn
 pytest
@@ -12,3 +12,5 @@ httpx
 pyjwt
 psycopg[binary]
 alembic
+slowapi
+sentry-sdk

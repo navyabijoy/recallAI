@@ -129,3 +129,64 @@ def test_memory_params_track_attempts(session):
     assert params is not None
     assert params.attempts_observed == 3
     assert "Easy" in params.speed_baselines
+
+
+# --- Phase 0: idempotency + uniqueness ---
+
+def test_duplicate_client_event_id_is_a_no_op(session):
+    """A retried POST (reload, offline queue, two tabs) must not double-count."""
+    user = session.get(User, "u1")
+    payload = _payload(client_event_id="evt-123")
+
+    first = ingest_solve(session, user, payload)
+    assert first["status"] == "success"
+
+    second = ingest_solve(session, user, payload)
+    assert second["status"] == "duplicate"
+    assert second["attempt_id"] == first["attempt_id"]
+
+    attempts = session.exec(select(SolveAttempt)).all()
+    assert len(attempts) == 1
+
+    params = session.get(UserMemoryParams, "u1")
+    assert params.attempts_observed == 1  # not bumped a second time
+
+    node = session.exec(select(KnowledgeNode).join(Topic).where(Topic.name == "Arrays")).first()
+    assert node.practice_count == 1  # not bumped a second time
+
+
+def test_duplicate_client_event_id_across_different_problems_still_dedups(session):
+    """The idempotency key alone determines identity — a resend can't be
+    reinterpreted as a different solve even if some other field changed."""
+    user = session.get(User, "u1")
+    ingest_solve(session, user, _payload(client_event_id="evt-456"))
+    result = ingest_solve(session, user, _payload(client_event_id="evt-456", platform_problem_id="two-sum-ii"))
+    assert result["status"] == "duplicate"
+    assert len(session.exec(select(SolveAttempt)).all()) == 1
+
+
+def test_missing_client_event_id_does_not_dedup(session):
+    """Older/manual/api_backfill payloads with no client_event_id keep working
+    as before — every post is treated as a distinct attempt."""
+    user = session.get(User, "u1")
+    ingest_solve(session, user, _payload())
+    ingest_solve(session, user, _payload())
+    assert len(session.exec(select(SolveAttempt)).all()) == 2
+
+
+def test_problem_platform_and_id_are_unique(session):
+    """Concurrent first-solves of the same problem must not create two Problem rows."""
+    from sqlalchemy.exc import IntegrityError
+    from backend.models import ProblemTopicLink
+
+    p1 = Problem(platform="leetcode", platform_problem_id="two-sum")
+    session.add(p1)
+    session.commit()
+
+    p2 = Problem(platform="leetcode", platform_problem_id="two-sum")
+    session.add(p2)
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+    assert len(session.exec(select(Problem).where(Problem.platform_problem_id == "two-sum")).all()) == 1

@@ -20,8 +20,9 @@
     topicTags: 'a[href^="/tag/"]',
     // Monaco editor hidden input; keystrokes here mean "started writing".
     editorInput: "textarea.inputarea, .monaco-editor textarea",
-    // Verdict text container after a submission.
-    verdictHosts: '[data-e2e-locator="submission-result"], [data-e2e-locator="console-result"]',
+    // Verdict text container after a real Submit (NOT "console-result", which
+    // is the Run-against-sample-tests panel and isn't a submission at all).
+    verdictHosts: '[data-e2e-locator="submission-result"]',
   };
 
   const VERDICTS = [
@@ -65,10 +66,10 @@
     return document.title.replace(/ - LeetCode.*/, "").trim() || null;
   }
 
-  function startProblem() {
+  async function startProblem() {
     const slug = slugFromUrl();
     if (!slug) return;
-    tracker.openProblem("leetcode:" + slug, {
+    await tracker.openProblem("leetcode:" + slug, {
       platform: "leetcode",
       platform_problem_id: slug,
       title: scrapeTitle(),
